@@ -4322,6 +4322,29 @@ local setfenv = setfenv
 --                                 take values from when the USE_CURRENT_TOP is used
 --
 -- Reference: https://www.lua.org/source/5.1/lvm.c.html#luaV_execute
+--
+-- Diagnostic helper for table accesses that hit nil. The plain
+-- "attempt to index a nil value" message cannot tell nil data apart from a
+-- register-layout bug, so the error carries pc, instruction count, the offending
+-- register and a stack snapshot. Only the nil path calls it, so correctly
+-- running code pays nothing.
+local function fmtVmIndexError(opname, pc, codeLength, registerIndex, key, stack)
+  local parts = {}
+  for index = 0, math.min(16, #stack + 2) do
+    local value = stack[index]
+    local valueType = type(value)
+    if valueType == "table" then
+      parts[#parts + 1] = index .. "=table"
+    elseif valueType == "string" then
+      parts[#parts + 1] = index .. "='" .. tostring(value):sub(1, 24) .. "'"
+    else
+      parts[#parts + 1] = index .. "=" .. tostring(value)
+    end
+  end
+  return string.format("TLC VM %s on nil value: pc=%d/%d reg=R%d key=%s | stack[%s]",
+    opname, pc, codeLength, registerIndex, tostring(key), table.concat(parts, ", "))
+end
+
 function VirtualMachine.executeClosure(closure, ...)
   --
   -- In our implementation, registers used in a function are stored in a unique
@@ -4438,7 +4461,11 @@ function VirtualMachine.executeClosure(closure, ...)
     -- OP_GETTABLE [A, B, C]    R(A) := R(B)[RK(C)]
     -- Read a table element into a register.
     elseif opname == "GETTABLE" then
-      stack[a] = stack[b][rk(c)]
+      local base = stack[b]
+      if base == nil then
+        error(fmtVmIndexError("GETTABLE", programCounter, codeLength, b, rk(c), stack), 0)
+      end
+      stack[a] = base[rk(c)]
 
     -- OP_SETGLOBAL [A, Bx]    Gbl[Kst(Bx)] := R(A)
     -- Write a register value into a global variable.
@@ -4454,7 +4481,11 @@ function VirtualMachine.executeClosure(closure, ...)
     -- OP_SETTABLE [A, B, C]    R(A)[RK(B)] := RK(C)
     -- Write a register value into a table element.
     elseif opname == "SETTABLE" then
-      stack[a][rk(b)] = rk(c)
+      local base = stack[a]
+      if base == nil then
+        error(fmtVmIndexError("SETTABLE", programCounter, codeLength, a, rk(b), stack), 0)
+      end
+      base[rk(b)] = rk(c)
 
     -- OP_NEWTABLE [A, B, C]    R(A) := {} (size = B,C)
     -- Create a new table and store it in a register.
@@ -4466,6 +4497,9 @@ function VirtualMachine.executeClosure(closure, ...)
     -- Prepare an object method for calling.
     elseif opname == "SELF" then
       local rb = stack[b]
+      if rb == nil then
+        error(fmtVmIndexError("SELF", programCounter, codeLength, b, rk(c), stack), 0)
+      end
       stack[a + 1] = rb
       stack[a] = rb[rk(c)]
 
