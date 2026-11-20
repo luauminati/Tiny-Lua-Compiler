@@ -1369,8 +1369,13 @@ function Parser:parsePrefixExpression()
     then
       primaryExpression = self:parseIndexSuffix(primaryExpression)
 
-    -- Method call.
-    elseif currentTokenKind == "Colon" then
+    -- Method call. Two Colons in a row are the `::` of a goto label, which can
+    -- never form a method call, so stop suffixing here and let the statement
+    -- parser pick the label up.
+    elseif
+      currentTokenKind == "Colon"
+      and self:peekNext().kind ~= "Colon"
+    then
       primaryExpression = self:parseMethodCallSuffix(primaryExpression)
 
     -- Implicit function call syntax (string or table): `f "str"` / `f {}`.
