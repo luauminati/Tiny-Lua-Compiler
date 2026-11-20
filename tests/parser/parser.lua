@@ -221,6 +221,37 @@ return function(suite)
       end
     )
 
+    suite:it("parses goto statements and labels", function()
+      local ast = tlc.parse("for i = 1, 2 do goto continue; ::continue:: end")
+      local statements = ast.body.statements[1].body.statements
+
+      suite:assertMatchesShape({
+        kind = "GotoStatement",
+        label = "continue",
+      }, statements[1])
+
+      suite:assertMatchesShape({
+        kind = "LabelStatement",
+        label = "continue",
+      }, statements[2])
+    end)
+
+    suite:it("keeps a label separate from the identifier before it", function()
+      local ast = tlc.parse([[
+        do
+          s = s + n
+          ::continue::
+        end
+      ]])
+      local statements = ast.body.statements[1].body.statements
+
+      suite:assertEqual("AssignmentStatement", statements[1].kind)
+      suite:assertMatchesShape({
+        kind = "LabelStatement",
+        label = "continue",
+      }, statements[2])
+    end)
+
     suite:it("errors on invalid statement starters", function()
       suite:assertError(function()
         tlc.parse("f() = 1")

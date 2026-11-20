@@ -636,6 +636,225 @@ return function(suite)
         ]])
         end
       )
+
+      suite:it("compiles constructors with more than 65535 entries", function()
+        -- `suite:it` installs a count hook (INFINITE_LOOP_LIMIT instructions) as
+        -- a dead-loop guard around every case. Building, compiling and running
+        -- 70k elements costs roughly 76M instructions, so the guard would abort
+        -- this case before it finished. `debug.gethook()` hands back the hook
+        -- function, mask and count, which allows pausing the guard here and
+        -- reinstalling it below. Pausing is safe for this case: the executed
+        -- chunk is one assignment and one return, with no loop to get stuck in.
+        local hook, mask, count = debug.gethook()
+        debug.sethook()
+
+        local fields = {}
+        for index = 1, 70000 do
+          fields[index] = '["k' .. index .. '"]=' .. index
+        end
+
+        local ok, result = pcall(function()
+          -- Runs through the TLC virtual machine: the bytecode emitter would
+          -- need 70k constants in one function, which PUC Lua 5.1 rejects.
+          return tlc.run("local t = { " .. table.concat(fields, ",") .. " }\n"
+            .. 'return tostring(t.k1) .. "," .. tostring(t.k70000)')
+        end)
+
+        -- Restored outside the pcall so the guard comes back even when the case
+        -- above fails.
+        debug.sethook(hook, mask, count)
+
+        if not ok then
+          error(result, 0)
+        end
+        suite:assertEqual("1,70000", result)
+      end)
+    end)
+
+    -- Lua 5.1 has no goto, so these cases cannot be compared against `loadstring`
+    -- and assert their result directly instead.
+    suite:describe("goto and labels (LuaJIT extension)", function()
+      suite:it("continues a numeric for loop", function()
+        suite:assertEqual("1,3,5", suite:compileAndRun([[
+          local out = {}
+          for i = 1, 5 do
+            if i % 2 == 0 then goto continue end
+            out[#out + 1] = i
+            ::continue::
+          end
+          return table.concat(out, ",")
+        ]]))
+      end)
+
+      suite:it("continues a generic for loop", function()
+        suite:assertEqual("a,c,d", suite:compileAndRun([[
+          local out = {}
+          for _, value in ipairs({"a", "b", "c", "d"}) do
+            if value == "b" then goto skip end
+            out[#out + 1] = value
+            ::skip::
+          end
+          return table.concat(out, ",")
+        ]]))
+      end)
+
+      suite:it("continues a while loop", function()
+        suite:assertEqual("1,2,4", suite:compileAndRun([[
+          local index, out = 0, {}
+          while index < 4 do
+            index = index + 1
+            if index == 3 then goto continue end
+            out[#out + 1] = index
+            ::continue::
+          end
+          return table.concat(out, ",")
+        ]]))
+      end)
+
+      suite:it("continues a repeat loop", function()
+        suite:assertEqual("1,3,4", suite:compileAndRun([[
+          local index, out = 0, {}
+          repeat
+            index = index + 1
+            if index == 2 then goto continue end
+            out[#out + 1] = index
+            ::continue::
+          until index >= 4
+          return table.concat(out, ",")
+        ]]))
+      end)
+
+      suite:it("supports backward jumps", function()
+        suite:assertEqual(3, suite:compileAndRun([[
+          local attempts = 0
+          ::retry::
+          attempts = attempts + 1
+          if attempts < 3 then goto retry end
+          return attempts
+        ]]))
+      end)
+
+      suite:it("accepts a label in the middle of a block", function()
+        suite:assertEqual(43, suite:compileAndRun([[
+          local value = 1
+          do
+            if value == 5 then goto done end
+            value = value + 41
+            ::done::
+            value = value + 1
+          end
+          return value
+        ]]))
+      end)
+
+      suite:it("scopes labels to their own loop", function()
+        suite:assertEqual("1:1,2:1", suite:compileAndRun([[
+          local out = {}
+          for i = 1, 2 do
+            for j = 1, 2 do
+              if j == 2 then goto continue end
+              out[#out + 1] = i .. ":" .. j
+              ::continue::
+            end
+          end
+          return table.concat(out, ",")
+        ]]))
+      end)
+
+      suite:it("mixes with break", function()
+        suite:assertEqual("1,3", suite:compileAndRun([[
+          local out = {}
+          for i = 1, 6 do
+            if i == 5 then break end
+            if i % 2 == 0 then goto continue end
+            out[#out + 1] = i
+            ::continue::
+          end
+          return table.concat(out, ",")
+        ]]))
+      end)
+    end)
+
+    suite:describe("Loop variables captured by closures", function()
+      suite:it("gives each numeric for iteration its own upvalue", function()
+        suite:assertMatchesLua([[
+          local funcs = {}
+          for i = 1, 3 do
+            funcs[i] = function() return i end
+          end
+          return funcs[1](), funcs[2](), funcs[3]()
+        ]])
+      end)
+
+      suite:it("gives each generic for iteration its own upvalues", function()
+        suite:assertMatchesLua([[
+          local funcs = {}
+          for key, value in ipairs({"a", "b", "c"}) do
+            funcs[key] = function() return key .. value end
+          end
+          return funcs[1](), funcs[2](), funcs[3]()
+        ]])
+      end)
+
+      suite:it("keeps the captured value alive after the loop ends", function()
+        suite:assertMatchesLua([[
+          local last
+          for i = 1, 3 do
+            last = function() return i end
+          end
+          return last()
+        ]])
+      end)
+
+      suite:it("gives each iteration its own upvalue in the TLC virtual machine", function()
+        local first, third = tlc.run([[
+          local funcs = {}
+          for i = 1, 3 do
+            funcs[i] = function() return i end
+          end
+          return funcs[1](), funcs[3]()
+        ]])
+
+        suite:assertEqual(1, first)
+        suite:assertEqual(3, third)
+      end)
+    end)
+
+    suite:describe("Closures and setfenv", function()
+      local hasSetfenv = setfenv ~= nil
+      local skipReason = "setfenv is not available in this interpreter"
+
+      suite:itIf(hasSetfenv, "uses an environment injected with setfenv", function()
+        local formula = tlc.run([[return function(x) return Max(x, 10) + 1 end]])
+
+        suite:assertError(function()
+          return formula(3)
+        end, "attempt to call")
+
+        setfenv(formula, { Max = math.max })
+        suite:assertEqual(11, formula(3))
+      end, skipReason)
+
+      suite:itIf(hasSetfenv, "keeps the creation environment without setfenv", function()
+        local func = tlc.run("return function() return value end", { value = 42 })
+
+        suite:assertEqual(42, func())
+      end, skipReason)
+
+      suite:itIf(hasSetfenv, "switches only the closure setfenv is applied to", function()
+        local make = tlc.run([[
+          return function()
+            return function() return target end
+          end
+        ]])
+        local first, second = make(), make()
+
+        setfenv(first, { target = "first" })
+        setfenv(second, { target = "second" })
+
+        suite:assertEqual("first", first())
+        suite:assertEqual("second", second())
+      end, skipReason)
     end)
 
     suite:describe("Compile-time errors", function()
@@ -659,6 +878,74 @@ return function(suite)
         suite:assertError(function()
           tlc.compileToProto("for i = 1 do return i end")
         end, "requires at least a start and limit expression")
+      end)
+
+      suite:it("errors on goto without a matching label", function()
+        suite:assertError(function()
+          tlc.compileToProto("goto missing")
+        end, "has no matching")
+      end)
+
+      suite:it("errors on goto jumping into a deeper loop", function()
+        suite:assertError(function()
+          tlc.compileToProto([[
+            goto inner
+            for i = 1, 2 do
+              ::inner::
+            end
+          ]])
+        end, "jumps into a deeper loop")
+      end)
+
+      suite:it("errors on goto skipping an upvalue-capturing scope", function()
+        suite:assertError(function()
+          tlc.compileToProto([[
+            for i = 1, 2 do
+              do
+                local captured = i
+                local closure = function() return captured end
+                if closure then goto continue end
+              end
+              ::continue::
+            end
+          ]])
+        end, "may skip the exit of an upvalue%-capturing")
+      end)
+    end)
+
+    suite:describe("Virtual machine diagnostics", function()
+      suite:it("reports register and stack context on GETTABLE", function()
+        suite:assertError(function()
+          tlc.run([[
+            local table0 = nil
+            return table0.key
+          ]])
+        end, "TLC VM GETTABLE on nil value: pc=%d+/%d+ reg=R%d+ key=key")
+      end)
+
+      suite:it("reports register and stack context on SETTABLE", function()
+        suite:assertError(function()
+          tlc.run([[
+            local table0 = nil
+            table0.key = 1
+          ]])
+        end, "TLC VM SETTABLE on nil value: pc=%d+/%d+ reg=R%d+ key=key")
+      end)
+
+      suite:it("reports register and stack context on SELF", function()
+        suite:assertError(function()
+          tlc.run([[
+            local table0 = nil
+            table0:method()
+          ]])
+        end, "TLC VM SELF on nil value: pc=%d+/%d+ reg=R%d+ key=method")
+      end)
+
+      suite:it("keeps normal table access working", function()
+        suite:assertMatchesLua([[
+          local table0 = { key = 1 }
+          return table0.key, table0.missing
+        ]])
       end)
     end)
 
