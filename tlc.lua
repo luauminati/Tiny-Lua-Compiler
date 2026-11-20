@@ -2023,10 +2023,12 @@ end
 function CodeGenerator:validateRegisterUsage()
   local currentScope = self.currentScope
   local currentRegisters = currentScope.allocatedRegisters
-  local variableCount = 0
-  for _ in pairs(currentScope.locals) do
-    variableCount = variableCount + 1
-  end
+
+  -- Counting `pairs(currentScope.locals)` would be wrong: Lua allows a name to
+  -- be declared again in the same scope (`function f(_, _)`, `local a` twice),
+  -- where every declaration still owns its own register while the name-keyed
+  -- table collapses them into a single entry.
+  local variableCount = currentScope.localCount
 
   if currentRegisters ~= variableCount then
     error(string.format(
@@ -2048,6 +2050,7 @@ function CodeGenerator:enterScope(isFunctionScope)
   self.currentScope = {
     parentScope        = parentScope,
     locals             = {},
+    localCount         = 0,
     isFunction         = isFunctionScope,
     needClose          = false,
     allocatedRegisters = allocatedRegisters,
@@ -2101,9 +2104,12 @@ end
 
 -- Binds a local variable name to a register in the current scope.
 -- If no register is specified, allocates the next available one.
+-- Every declaration bumps `localCount`, even when the name shadows an existing
+-- one (e.g. `function f(_, _)`): the register is a fresh slot either way.
 function CodeGenerator:declareLocalVariable(varName, register)
   register = register or self:allocateRegisters(1)
   self.currentScope.locals[varName] = register
+  self.currentScope.localCount = self.currentScope.localCount + 1
   return register
 end
 
