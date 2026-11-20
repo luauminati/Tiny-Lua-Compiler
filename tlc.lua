@@ -189,10 +189,10 @@ local TOKENIZER_CONFIG = {
   KEYWORDS = createLookupTable({
     "and",      "break", "do",    "else",
     "elseif",   "end",   "false", "for",
-    "function", "if",    "in",    "local",
-    "nil",      "not",   "or",    "repeat",
-    "return",   "then",  "true",  "until",
-    "while"
+    "function", "goto",  "if",    "in",
+    "local",    "nil",   "not",   "or",
+    "repeat",   "return", "then", "true",
+    "until",    "while"
   })
 }
 
@@ -829,6 +829,7 @@ function Parser.new(tokens)
     ["break"]    = self.parseBreakStatement,
     ["for"]      = self.parseForStatement,
     ["function"] = self.parseFunctionDeclaration,
+    ["goto"]     = self.parseGotoStatement,
     ["if"]       = self.parseIfStatement,
     ["local"]    = self.parseLocalStatement,
     ["repeat"]   = self.parseRepeatStatement,
@@ -1562,6 +1563,33 @@ function Parser:parseBreakStatement()
   return { kind = "BreakStatement" }
 end
 
+-- LuaJIT extension: `goto label` jumps to the matching `::label::` in the same
+-- function. Only the continue-style usage (label inside a loop body) has a
+-- well-defined register story here, see parseLabelStatement.
+function Parser:parseGotoStatement()
+  self:expectKeyword("goto")
+  local label = self:expectIdentifier()
+  return { kind = "GotoStatement", label = label }
+end
+
+-- LuaJIT extension: `::label::` declares a label. Labels may appear anywhere in
+-- a block, not only at its tail: a jump lands on the statement boundary right
+-- after the label, and at statement boundaries the registers only hold the
+-- locals that are live there. Locals declared between the goto and the label
+-- are outside the label's lexical scope, so code after the label cannot reach
+-- their registers (unknown names resolve to globals, never to stale slots).
+-- The one real hazard - jumping out of a scope whose locals were captured as
+-- upvalues, which would need an OP_CLOSE - is rejected in the code generator.
+function Parser:parseLabelStatement()
+  self:expect("Colon")
+  self:expect("Colon")
+  local label = self:expectIdentifier()
+  self:expect("Colon")
+  self:expect("Colon")
+
+  return { kind = "LabelStatement", label = label }
+end
+
 function Parser:parseIfStatement()
   -- Parse the first `if` clause, then any number of `elseif` clauses.
   -- The optional `else` body is stored separately because it has no condition.
@@ -1743,7 +1771,10 @@ function Parser:parseNextStatement()
 
   local currentToken = self.currentToken
   local tokenKind    = currentToken.kind
-  if tokenKind == "Keyword" then
+  if tokenKind == "Colon" then
+    node = self:parseLabelStatement()
+
+  elseif tokenKind == "Keyword" then
     local keyword = currentToken.value
 
     -- Stop at block terminators and let the parent parser handle them.
@@ -1967,7 +1998,15 @@ function CodeGenerator.new(ast)
     proto = nil,
 
     currentScope      = nil,
-    pendingBreakJumps = nil
+    pendingBreakJumps = nil,
+
+    -- goto support: label positions (per function) plus forward jumps that wait
+    -- for their label and get patched once that label statement is compiled.
+    labelPositions    = nil,
+    labelLoopDepth    = nil,
+    labelDepths       = nil,
+    pendingGotoJumps  = nil,
+    loopDepth         = 0
   }, CodeGenerator)
 end
 
@@ -2006,7 +2045,8 @@ function CodeGenerator:enterScope(isFunctionScope)
     locals             = {},
     isFunction         = isFunctionScope,
     needClose          = false,
-    allocatedRegisters = allocatedRegisters
+    allocatedRegisters = allocatedRegisters,
+    depth              = (parentScope and parentScope.depth or 0) + 1
   }
 end
 
@@ -2365,7 +2405,9 @@ function CodeGenerator:breakable(callback)
   local previousPendingJumps = self.pendingBreakJumps
   self.pendingBreakJumps = {}
 
+  self.loopDepth = self.loopDepth + 1
   callback()
+  self.loopDepth = self.loopDepth - 1
 
   -- Patch breaks before emitting CLOSE so they land exactly
   -- on the cleanup instruction when one is needed.
@@ -2892,6 +2934,111 @@ function CodeGenerator:BreakStatement()
 end
 
 -- Instruction Layout:
+--   JMP [label]                    ; backward: patched straight to the label pc
+--                                  ; forward: patched later by LabelStatement
+--
+-- goto reuses the same OP_JMP machinery as break. Labels are per function, and
+-- a goto may only target a label of the same or an enclosing loop (label loop
+-- depth <= goto loop depth), which covers the `goto continue` shape and
+-- rejects jumps into deeper loops.
+--
+-- A goto must not skip the exit of a scope whose locals were captured as
+-- upvalues: leaving such a scope requires OP_CLOSE, and jumping past it would
+-- leave the upvalues pointing at registers that get reused, so closures would
+-- read stale values. Scopes between a forward goto and its label are not known
+-- yet, so collectCloseDepths walks the scope chain up front and every pending
+-- jump keeps that snapshot.
+--
+-- Returns the depths of all needClose scopes (locals captured by inner
+-- closures) between the current position and the enclosing function boundary.
+function CodeGenerator:collectCloseDepths()
+  local depths
+  local scope = self.currentScope
+  while scope do
+    if scope.isFunction then
+      break
+    end
+    if scope.needClose then
+      depths = depths or {}
+      depths[#depths + 1] = scope.depth
+    end
+    scope = scope.parentScope
+  end
+  return depths
+end
+
+-- The jump from depth gotoDepth to depth labelDepth skips the exits of the
+-- scopes with a depth in (labelDepth, gotoDepth]. A needClose scope that
+-- contains both endpoints is harmless and must not reject the jump.
+local function crossesCloseScope(closes, gotoDepth, labelDepth)
+  if not closes then
+    return false
+  end
+  for _, depth in ipairs(closes) do
+    if depth > labelDepth and depth <= gotoDepth then
+      return true, depth
+    end
+  end
+  return false
+end
+
+function CodeGenerator:GotoStatement(node)
+  local closes    = self:collectCloseDepths()
+  local gotoDepth = self.currentScope.depth
+
+  local targetPC = self.labelPositions[node.label]
+  if targetPC then
+    if self.labelLoopDepth[node.label] > self.loopDepth then
+      error("goto '" .. node.label .. "' jumps into a deeper loop, which is not supported")
+    end
+    local crosses = crossesCloseScope(closes, gotoDepth, self.labelDepths[node.label])
+    if crosses then
+      error("goto '" .. node.label .. "' may skip the exit of an upvalue-capturing "
+        .. "scope, which is not supported")
+    end
+    local jumpPC = self:emitJump()
+    self:patchJump(jumpPC, targetPC)
+  else
+    local pending = self.pendingGotoJumps[node.label]
+    if not pending then
+      pending = {}
+      self.pendingGotoJumps[node.label] = pending
+    end
+    pending[#pending + 1] = {
+      pc        = self:emitJump(),
+      loopDepth = self.loopDepth,
+      closes    = closes,
+      gotoDepth = gotoDepth
+    }
+  end
+end
+
+-- A label compiles to nothing on its own: it only records the pc of the next
+-- instruction and resolves every forward goto waiting on that label.
+function CodeGenerator:LabelStatement(node)
+  local labelDepth = self.currentScope.depth
+  self.labelPositions[node.label] = #self.proto.code + 1
+  self.labelLoopDepth[node.label] = self.loopDepth
+  self.labelDepths[node.label]    = labelDepth
+
+  local pending = self.pendingGotoJumps[node.label]
+  if pending then
+    for _, entry in ipairs(pending) do
+      if self.loopDepth > entry.loopDepth then
+        error("goto '" .. node.label .. "' jumps into a deeper loop, which is not supported")
+      end
+      local crosses = crossesCloseScope(entry.closes, entry.gotoDepth, labelDepth)
+      if crosses then
+        error("goto '" .. node.label .. "' may skip the exit of an upvalue-capturing "
+          .. "scope, which is not supported")
+      end
+      self:patchJump(entry.pc, #self.proto.code + 1)
+    end
+    self.pendingGotoJumps[node.label] = nil
+  end
+end
+
+-- Instruction Layout:
 --   local a, b, c = expr1, expr2
 --   <evaluate expr1>               ; Result in R(0)
 --   <evaluate expr2>               ; Result in R(1)
@@ -3330,12 +3477,32 @@ end
 function CodeGenerator:compileFunctionBody(node)
   local previousBreakJumpPCs = self.pendingBreakJumps
   self.pendingBreakJumps = nil
+
+  -- Labels are per function (a goto never crosses a function boundary), so the
+  -- label state is saved and reset here, then restored after the body.
+  local previousLabelPositions   = self.labelPositions
+  local previousLabelLoopDepth   = self.labelLoopDepth
+  local previousLabelDepths      = self.labelDepths
+  local previousPendingGotoJumps = self.pendingGotoJumps
+  local previousLoopDepth        = self.loopDepth
+  self.labelPositions   = {}
+  self.labelLoopDepth   = {}
+  self.labelDepths      = {}
+  self.pendingGotoJumps = {}
+  self.loopDepth        = 0
+
   self:enterScope(true) -- Enter function scope.
   for _, paramName in ipairs(node.parameters) do
     self:declareLocalVariable(paramName)
   end
 
   self:compileChunk(node.body)
+
+  -- Anything still pending here targets a label that does not exist in this
+  -- function, which is a compile error.
+  for label in pairs(self.pendingGotoJumps) do
+    error("goto '" .. label .. "' has no matching '::" .. label .. "::' label in its function")
+  end
 
   -- Generate default return statement.
   -- Every function must always end with a return instruction at the end in order
@@ -3345,6 +3512,11 @@ function CodeGenerator:compileFunctionBody(node)
   self:emitInstruction("RETURN", 0, 1, 0)
   self:leaveScope()
   self.pendingBreakJumps = previousBreakJumpPCs
+  self.labelPositions    = previousLabelPositions
+  self.labelLoopDepth    = previousLabelLoopDepth
+  self.labelDepths       = previousLabelDepths
+  self.pendingGotoJumps  = previousPendingGotoJumps
+  self.loopDepth         = previousLoopDepth
 end
 
 -- Generates a CLOSURE instruction to instantiate a function from its
