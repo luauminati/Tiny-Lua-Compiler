@@ -1967,10 +1967,13 @@ local CODE_GENERATOR_CONFIG = {
 --
 -- Reference: https://www.lua.org/source/5.1/lobject.c.html#luaO_int2fb
 local function encodeTableSize(size)
-  -- This is not the real limit; it was chosen arbitrarily to prevent
-  -- potential overflows in instruction operands.
+  -- The NEWTABLE size operands are preallocation HINTS, never exact sizes: this
+  -- VM ignores them entirely (`NEWTABLE` just stores a fresh table) and real
+  -- Lua decodes them loosely, growing the table on demand. Oversized
+  -- constructors - e.g. a language StringDB with 80k+ entries - therefore clamp
+  -- to the largest encodable hint instead of failing to compile.
   if size >= 65536 then
-    error("Table size too large to encode: " .. size)
+    return 255
   end
 
   local exponent = 0
