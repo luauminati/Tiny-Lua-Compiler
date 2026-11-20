@@ -4286,6 +4286,16 @@ end
 
 local VirtualMachine = {}
 
+-- Sentinel environment for closures handed out by the VM. Every closure is a
+-- plain Lua function whose env starts out as this table, so a call can tell
+-- whether the host replaced the env through setfenv. Code that injects helpers
+-- into a compiled function (e.g. `setfenv(formulaFunc, FormulaEnv)` to provide
+-- Max/Min/round) only works if the closure honours that replacement; without it
+-- the helpers are looked up in the creation env and resolve to nil.
+local CLOSURE_ENV_SENTINEL = {}
+local getfenv = getfenv
+local setfenv = setfenv
+
 --// Execution //--
 
 -- Runtime frame layout:
@@ -4770,9 +4780,17 @@ function VirtualMachine.executeClosure(closure, ...)
         env      = closureEnv
       }
 
-      stack[a] = function(...)
+      local closureFn = function(...)
+        -- If the env is no longer the sentinel, the caller replaced it with
+        -- setfenv, so run every global access against the new env.
+        local currentEnv = getfenv(1)
+        if currentEnv ~= CLOSURE_ENV_SENTINEL then
+          newClosure.env = currentEnv
+        end
         return VirtualMachine.executeClosure(newClosure, ...)
       end
+      setfenv(closureFn, CLOSURE_ENV_SENTINEL)
+      stack[a] = closureFn
 
     -- OP_VARARG [A, B]    R(A), R(A+1), ..., R(A+B-1) = vararg
     -- Load vararg function arguments into registers.
