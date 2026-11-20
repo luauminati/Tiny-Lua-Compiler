@@ -189,10 +189,10 @@ local TOKENIZER_CONFIG = {
   KEYWORDS = createLookupTable({
     "and",      "break", "do",    "else",
     "elseif",   "end",   "false", "for",
-    "function", "if",    "in",    "local",
-    "nil",      "not",   "or",    "repeat",
-    "return",   "then",  "true",  "until",
-    "while"
+    "function", "goto",  "if",    "in",
+    "local",    "nil",   "not",   "or",
+    "repeat",   "return", "then", "true",
+    "until",    "while"
   })
 }
 
@@ -829,6 +829,7 @@ function Parser.new(tokens)
     ["break"]    = self.parseBreakStatement,
     ["for"]      = self.parseForStatement,
     ["function"] = self.parseFunctionDeclaration,
+    ["goto"]     = self.parseGotoStatement,
     ["if"]       = self.parseIfStatement,
     ["local"]    = self.parseLocalStatement,
     ["repeat"]   = self.parseRepeatStatement,
@@ -1368,8 +1369,13 @@ function Parser:parsePrefixExpression()
     then
       primaryExpression = self:parseIndexSuffix(primaryExpression)
 
-    -- Method call.
-    elseif currentTokenKind == "Colon" then
+    -- Method call. Two Colons in a row are the `::` of a goto label, which can
+    -- never form a method call, so stop suffixing here and let the statement
+    -- parser pick the label up.
+    elseif
+      currentTokenKind == "Colon"
+      and self:peekNext().kind ~= "Colon"
+    then
       primaryExpression = self:parseMethodCallSuffix(primaryExpression)
 
     -- Implicit function call syntax (string or table): `f "str"` / `f {}`.
@@ -1562,6 +1568,33 @@ function Parser:parseBreakStatement()
   return { kind = "BreakStatement" }
 end
 
+-- LuaJIT extension: `goto label` jumps to the matching `::label::` in the same
+-- function. Only the continue-style usage (label inside a loop body) has a
+-- well-defined register story here, see parseLabelStatement.
+function Parser:parseGotoStatement()
+  self:expectKeyword("goto")
+  local label = self:expectIdentifier()
+  return { kind = "GotoStatement", label = label }
+end
+
+-- LuaJIT extension: `::label::` declares a label. Labels may appear anywhere in
+-- a block, not only at its tail: a jump lands on the statement boundary right
+-- after the label, and at statement boundaries the registers only hold the
+-- locals that are live there. Locals declared between the goto and the label
+-- are outside the label's lexical scope, so code after the label cannot reach
+-- their registers (unknown names resolve to globals, never to stale slots).
+-- The one real hazard - jumping out of a scope whose locals were captured as
+-- upvalues, which would need an OP_CLOSE - is rejected in the code generator.
+function Parser:parseLabelStatement()
+  self:expect("Colon")
+  self:expect("Colon")
+  local label = self:expectIdentifier()
+  self:expect("Colon")
+  self:expect("Colon")
+
+  return { kind = "LabelStatement", label = label }
+end
+
 function Parser:parseIfStatement()
   -- Parse the first `if` clause, then any number of `elseif` clauses.
   -- The optional `else` body is stored separately because it has no condition.
@@ -1743,7 +1776,10 @@ function Parser:parseNextStatement()
 
   local currentToken = self.currentToken
   local tokenKind    = currentToken.kind
-  if tokenKind == "Keyword" then
+  if tokenKind == "Colon" then
+    node = self:parseLabelStatement()
+
+  elseif tokenKind == "Keyword" then
     local keyword = currentToken.value
 
     -- Stop at block terminators and let the parent parser handle them.
@@ -1931,10 +1967,13 @@ local CODE_GENERATOR_CONFIG = {
 --
 -- Reference: https://www.lua.org/source/5.1/lobject.c.html#luaO_int2fb
 local function encodeTableSize(size)
-  -- This is not the real limit; it was chosen arbitrarily to prevent
-  -- potential overflows in instruction operands.
+  -- The NEWTABLE size operands are preallocation HINTS, never exact sizes: this
+  -- VM ignores them entirely (`NEWTABLE` just stores a fresh table) and real
+  -- Lua decodes them loosely, growing the table on demand. Oversized
+  -- constructors - e.g. a language StringDB with 80k+ entries - therefore clamp
+  -- to the largest encodable hint instead of failing to compile.
   if size >= 65536 then
-    error("Table size too large to encode: " .. size)
+    return 255
   end
 
   local exponent = 0
@@ -1967,7 +2006,15 @@ function CodeGenerator.new(ast)
     proto = nil,
 
     currentScope      = nil,
-    pendingBreakJumps = nil
+    pendingBreakJumps = nil,
+
+    -- goto support: label positions (per function) plus forward jumps that wait
+    -- for their label and get patched once that label statement is compiled.
+    labelPositions    = nil,
+    labelLoopDepth    = nil,
+    labelDepths       = nil,
+    pendingGotoJumps  = nil,
+    loopDepth         = 0
   }, CodeGenerator)
 end
 
@@ -1979,10 +2026,12 @@ end
 function CodeGenerator:validateRegisterUsage()
   local currentScope = self.currentScope
   local currentRegisters = currentScope.allocatedRegisters
-  local variableCount = 0
-  for _ in pairs(currentScope.locals) do
-    variableCount = variableCount + 1
-  end
+
+  -- Counting `pairs(currentScope.locals)` would be wrong: Lua allows a name to
+  -- be declared again in the same scope (`function f(_, _)`, `local a` twice),
+  -- where every declaration still owns its own register while the name-keyed
+  -- table collapses them into a single entry.
+  local variableCount = currentScope.localCount
 
   if currentRegisters ~= variableCount then
     error(string.format(
@@ -2004,9 +2053,11 @@ function CodeGenerator:enterScope(isFunctionScope)
   self.currentScope = {
     parentScope        = parentScope,
     locals             = {},
+    localCount         = 0,
     isFunction         = isFunctionScope,
     needClose          = false,
-    allocatedRegisters = allocatedRegisters
+    allocatedRegisters = allocatedRegisters,
+    depth              = (parentScope and parentScope.depth or 0) + 1
   }
 end
 
@@ -2056,9 +2107,12 @@ end
 
 -- Binds a local variable name to a register in the current scope.
 -- If no register is specified, allocates the next available one.
+-- Every declaration bumps `localCount`, even when the name shadows an existing
+-- one (e.g. `function f(_, _)`): the register is a fresh slot either way.
 function CodeGenerator:declareLocalVariable(varName, register)
   register = register or self:allocateRegisters(1)
   self.currentScope.locals[varName] = register
+  self.currentScope.localCount = self.currentScope.localCount + 1
   return register
 end
 
@@ -2365,7 +2419,9 @@ function CodeGenerator:breakable(callback)
   local previousPendingJumps = self.pendingBreakJumps
   self.pendingBreakJumps = {}
 
+  self.loopDepth = self.loopDepth + 1
   callback()
+  self.loopDepth = self.loopDepth - 1
 
   -- Patch breaks before emitting CLOSE so they land exactly
   -- on the cleanup instruction when one is needed.
@@ -2892,6 +2948,111 @@ function CodeGenerator:BreakStatement()
 end
 
 -- Instruction Layout:
+--   JMP [label]                    ; backward: patched straight to the label pc
+--                                  ; forward: patched later by LabelStatement
+--
+-- goto reuses the same OP_JMP machinery as break. Labels are per function, and
+-- a goto may only target a label of the same or an enclosing loop (label loop
+-- depth <= goto loop depth), which covers the `goto continue` shape and
+-- rejects jumps into deeper loops.
+--
+-- A goto must not skip the exit of a scope whose locals were captured as
+-- upvalues: leaving such a scope requires OP_CLOSE, and jumping past it would
+-- leave the upvalues pointing at registers that get reused, so closures would
+-- read stale values. Scopes between a forward goto and its label are not known
+-- yet, so collectCloseDepths walks the scope chain up front and every pending
+-- jump keeps that snapshot.
+--
+-- Returns the depths of all needClose scopes (locals captured by inner
+-- closures) between the current position and the enclosing function boundary.
+function CodeGenerator:collectCloseDepths()
+  local depths
+  local scope = self.currentScope
+  while scope do
+    if scope.isFunction then
+      break
+    end
+    if scope.needClose then
+      depths = depths or {}
+      depths[#depths + 1] = scope.depth
+    end
+    scope = scope.parentScope
+  end
+  return depths
+end
+
+-- The jump from depth gotoDepth to depth labelDepth skips the exits of the
+-- scopes with a depth in (labelDepth, gotoDepth]. A needClose scope that
+-- contains both endpoints is harmless and must not reject the jump.
+local function crossesCloseScope(closes, gotoDepth, labelDepth)
+  if not closes then
+    return false
+  end
+  for _, depth in ipairs(closes) do
+    if depth > labelDepth and depth <= gotoDepth then
+      return true, depth
+    end
+  end
+  return false
+end
+
+function CodeGenerator:GotoStatement(node)
+  local closes    = self:collectCloseDepths()
+  local gotoDepth = self.currentScope.depth
+
+  local targetPC = self.labelPositions[node.label]
+  if targetPC then
+    if self.labelLoopDepth[node.label] > self.loopDepth then
+      error("goto '" .. node.label .. "' jumps into a deeper loop, which is not supported")
+    end
+    local crosses = crossesCloseScope(closes, gotoDepth, self.labelDepths[node.label])
+    if crosses then
+      error("goto '" .. node.label .. "' may skip the exit of an upvalue-capturing "
+        .. "scope, which is not supported")
+    end
+    local jumpPC = self:emitJump()
+    self:patchJump(jumpPC, targetPC)
+  else
+    local pending = self.pendingGotoJumps[node.label]
+    if not pending then
+      pending = {}
+      self.pendingGotoJumps[node.label] = pending
+    end
+    pending[#pending + 1] = {
+      pc        = self:emitJump(),
+      loopDepth = self.loopDepth,
+      closes    = closes,
+      gotoDepth = gotoDepth
+    }
+  end
+end
+
+-- A label compiles to nothing on its own: it only records the pc of the next
+-- instruction and resolves every forward goto waiting on that label.
+function CodeGenerator:LabelStatement(node)
+  local labelDepth = self.currentScope.depth
+  self.labelPositions[node.label] = #self.proto.code + 1
+  self.labelLoopDepth[node.label] = self.loopDepth
+  self.labelDepths[node.label]    = labelDepth
+
+  local pending = self.pendingGotoJumps[node.label]
+  if pending then
+    for _, entry in ipairs(pending) do
+      if self.loopDepth > entry.loopDepth then
+        error("goto '" .. node.label .. "' jumps into a deeper loop, which is not supported")
+      end
+      local crosses = crossesCloseScope(entry.closes, entry.gotoDepth, labelDepth)
+      if crosses then
+        error("goto '" .. node.label .. "' may skip the exit of an upvalue-capturing "
+          .. "scope, which is not supported")
+      end
+      self:patchJump(entry.pc, #self.proto.code + 1)
+    end
+    self.pendingGotoJumps[node.label] = nil
+  end
+end
+
+-- Instruction Layout:
 --   local a, b, c = expr1, expr2
 --   <evaluate expr1>               ; Result in R(0)
 --   <evaluate expr2>               ; Result in R(1)
@@ -3022,12 +3183,21 @@ function CodeGenerator:ForGenericStatement(node)
   self:enterScope()
   local baseRegister = self.currentScope.allocatedRegisters
   self:compileExpressionList(expressions, 3)
-  self:declareLocalVariables(iterators)
 
   local startJmpInstruction = self:emitJump()
   local loopStartPC = #self.proto.code
   self:breakable(function()
-    self:compileChunk(body)
+    -- Lua 5.1 semantics: closures created inside the body capture the loop
+    -- variable of THEIR iteration, not a slot shared by every iteration.
+    -- Declaring the iterators in the body scope (instead of the enclosing for
+    -- scope) lets the per-iteration leaveScope emit OP_CLOSE, which snapshots
+    -- the current value into the upvalue. Auto-allocation lands exactly on
+    -- R(A+3).. where TFORLOOP writes the values.
+    self:enterScope()
+    self:declareLocalVariables(iterators)
+    self:compileStatementList(body.statements)
+    self:leaveScope()
+
     self:patchJumpToHere(startJmpInstruction)
 
     -- OP_TFORLOOP [A, C]    R(A+3), ... ,R(A+2+C) := R(A)(R(A+1), R(A+2))
@@ -3093,9 +3263,14 @@ function CodeGenerator:ForNumericStatement(node)
   --   R(A+1) - limit
   --   R(A+2) - step
   --   R(A+3) - user loop variable "varName" (copied from R(A) every iteration)
-  self:declareLocalVariable(varName, self:allocateRegisters(1))
   self:breakable(function()
-    self:compileChunk(body)
+    -- Same per-iteration capture rule as ForGenericStatement: the user loop
+    -- variable is declared in the body scope so that every iteration's
+    -- leaveScope can close upvalues pointing at R(A+3).
+    self:enterScope()
+    self:declareLocalVariable(varName)
+    self:compileStatementList(body.statements)
+    self:leaveScope()
 
     local loopEndPC = #self.proto.code
     local relativeLoopStartPC = loopEndPC - loopStartPC
@@ -3330,12 +3505,32 @@ end
 function CodeGenerator:compileFunctionBody(node)
   local previousBreakJumpPCs = self.pendingBreakJumps
   self.pendingBreakJumps = nil
+
+  -- Labels are per function (a goto never crosses a function boundary), so the
+  -- label state is saved and reset here, then restored after the body.
+  local previousLabelPositions   = self.labelPositions
+  local previousLabelLoopDepth   = self.labelLoopDepth
+  local previousLabelDepths      = self.labelDepths
+  local previousPendingGotoJumps = self.pendingGotoJumps
+  local previousLoopDepth        = self.loopDepth
+  self.labelPositions   = {}
+  self.labelLoopDepth   = {}
+  self.labelDepths      = {}
+  self.pendingGotoJumps = {}
+  self.loopDepth        = 0
+
   self:enterScope(true) -- Enter function scope.
   for _, paramName in ipairs(node.parameters) do
     self:declareLocalVariable(paramName)
   end
 
   self:compileChunk(node.body)
+
+  -- Anything still pending here targets a label that does not exist in this
+  -- function, which is a compile error.
+  for label in pairs(self.pendingGotoJumps) do
+    error("goto '" .. label .. "' has no matching '::" .. label .. "::' label in its function")
+  end
 
   -- Generate default return statement.
   -- Every function must always end with a return instruction at the end in order
@@ -3345,6 +3540,11 @@ function CodeGenerator:compileFunctionBody(node)
   self:emitInstruction("RETURN", 0, 1, 0)
   self:leaveScope()
   self.pendingBreakJumps = previousBreakJumpPCs
+  self.labelPositions    = previousLabelPositions
+  self.labelLoopDepth    = previousLabelLoopDepth
+  self.labelDepths       = previousLabelDepths
+  self.pendingGotoJumps  = previousPendingGotoJumps
+  self.loopDepth         = previousLoopDepth
 end
 
 -- Generates a CLOSURE instruction to instantiate a function from its
@@ -4100,6 +4300,16 @@ end
 
 local VirtualMachine = {}
 
+-- Sentinel environment for closures handed out by the VM. Every closure is a
+-- plain Lua function whose env starts out as this table, so a call can tell
+-- whether the host replaced the env through setfenv. Code that injects helpers
+-- into a compiled function (e.g. `setfenv(formulaFunc, FormulaEnv)` to provide
+-- Max/Min/round) only works if the closure honours that replacement; without it
+-- the helpers are looked up in the creation env and resolve to nil.
+local CLOSURE_ENV_SENTINEL = {}
+local getfenv = getfenv
+local setfenv = setfenv
+
 --// Execution //--
 
 -- Runtime frame layout:
@@ -4112,6 +4322,29 @@ local VirtualMachine = {}
 --                                 take values from when the USE_CURRENT_TOP is used
 --
 -- Reference: https://www.lua.org/source/5.1/lvm.c.html#luaV_execute
+--
+-- Diagnostic helper for table accesses that hit nil. The plain
+-- "attempt to index a nil value" message cannot tell nil data apart from a
+-- register-layout bug, so the error carries pc, instruction count, the offending
+-- register and a stack snapshot. Only the nil path calls it, so correctly
+-- running code pays nothing.
+local function fmtVmIndexError(opname, pc, codeLength, registerIndex, key, stack)
+  local parts = {}
+  for index = 0, math.min(16, #stack + 2) do
+    local value = stack[index]
+    local valueType = type(value)
+    if valueType == "table" then
+      parts[#parts + 1] = index .. "=table"
+    elseif valueType == "string" then
+      parts[#parts + 1] = index .. "='" .. tostring(value):sub(1, 24) .. "'"
+    else
+      parts[#parts + 1] = index .. "=" .. tostring(value)
+    end
+  end
+  return string.format("TLC VM %s on nil value: pc=%d/%d reg=R%d key=%s | stack[%s]",
+    opname, pc, codeLength, registerIndex, tostring(key), table.concat(parts, ", "))
+end
+
 function VirtualMachine.executeClosure(closure, ...)
   --
   -- In our implementation, registers used in a function are stored in a unique
@@ -4228,7 +4461,11 @@ function VirtualMachine.executeClosure(closure, ...)
     -- OP_GETTABLE [A, B, C]    R(A) := R(B)[RK(C)]
     -- Read a table element into a register.
     elseif opname == "GETTABLE" then
-      stack[a] = stack[b][rk(c)]
+      local base = stack[b]
+      if base == nil then
+        error(fmtVmIndexError("GETTABLE", programCounter, codeLength, b, rk(c), stack), 0)
+      end
+      stack[a] = base[rk(c)]
 
     -- OP_SETGLOBAL [A, Bx]    Gbl[Kst(Bx)] := R(A)
     -- Write a register value into a global variable.
@@ -4244,7 +4481,11 @@ function VirtualMachine.executeClosure(closure, ...)
     -- OP_SETTABLE [A, B, C]    R(A)[RK(B)] := RK(C)
     -- Write a register value into a table element.
     elseif opname == "SETTABLE" then
-      stack[a][rk(b)] = rk(c)
+      local base = stack[a]
+      if base == nil then
+        error(fmtVmIndexError("SETTABLE", programCounter, codeLength, a, rk(b), stack), 0)
+      end
+      base[rk(b)] = rk(c)
 
     -- OP_NEWTABLE [A, B, C]    R(A) := {} (size = B,C)
     -- Create a new table and store it in a register.
@@ -4256,6 +4497,9 @@ function VirtualMachine.executeClosure(closure, ...)
     -- Prepare an object method for calling.
     elseif opname == "SELF" then
       local rb = stack[b]
+      if rb == nil then
+        error(fmtVmIndexError("SELF", programCounter, codeLength, b, rk(c), stack), 0)
+      end
       stack[a + 1] = rb
       stack[a] = rb[rk(c)]
 
@@ -4584,9 +4828,17 @@ function VirtualMachine.executeClosure(closure, ...)
         env      = closureEnv
       }
 
-      stack[a] = function(...)
+      local closureFn = function(...)
+        -- If the env is no longer the sentinel, the caller replaced it with
+        -- setfenv, so run every global access against the new env.
+        local currentEnv = getfenv(1)
+        if currentEnv ~= CLOSURE_ENV_SENTINEL then
+          newClosure.env = currentEnv
+        end
         return VirtualMachine.executeClosure(newClosure, ...)
       end
+      setfenv(closureFn, CLOSURE_ENV_SENTINEL)
+      stack[a] = closureFn
 
     -- OP_VARARG [A, B]    R(A), R(A+1), ..., R(A+B-1) = vararg
     -- Load vararg function arguments into registers.
