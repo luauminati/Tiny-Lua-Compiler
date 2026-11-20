@@ -3183,12 +3183,21 @@ function CodeGenerator:ForGenericStatement(node)
   self:enterScope()
   local baseRegister = self.currentScope.allocatedRegisters
   self:compileExpressionList(expressions, 3)
-  self:declareLocalVariables(iterators)
 
   local startJmpInstruction = self:emitJump()
   local loopStartPC = #self.proto.code
   self:breakable(function()
-    self:compileChunk(body)
+    -- Lua 5.1 semantics: closures created inside the body capture the loop
+    -- variable of THEIR iteration, not a slot shared by every iteration.
+    -- Declaring the iterators in the body scope (instead of the enclosing for
+    -- scope) lets the per-iteration leaveScope emit OP_CLOSE, which snapshots
+    -- the current value into the upvalue. Auto-allocation lands exactly on
+    -- R(A+3).. where TFORLOOP writes the values.
+    self:enterScope()
+    self:declareLocalVariables(iterators)
+    self:compileStatementList(body.statements)
+    self:leaveScope()
+
     self:patchJumpToHere(startJmpInstruction)
 
     -- OP_TFORLOOP [A, C]    R(A+3), ... ,R(A+2+C) := R(A)(R(A+1), R(A+2))
@@ -3254,9 +3263,14 @@ function CodeGenerator:ForNumericStatement(node)
   --   R(A+1) - limit
   --   R(A+2) - step
   --   R(A+3) - user loop variable "varName" (copied from R(A) every iteration)
-  self:declareLocalVariable(varName, self:allocateRegisters(1))
   self:breakable(function()
-    self:compileChunk(body)
+    -- Same per-iteration capture rule as ForGenericStatement: the user loop
+    -- variable is declared in the body scope so that every iteration's
+    -- leaveScope can close upvalues pointing at R(A+3).
+    self:enterScope()
+    self:declareLocalVariable(varName)
+    self:compileStatementList(body.statements)
+    self:leaveScope()
 
     local loopEndPC = #self.proto.code
     local relativeLoopStartPC = loopEndPC - loopStartPC
